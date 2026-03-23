@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Dict
+import importlib
+import sys
+
+import torch
+from torch.utils.data import DataLoader
+
+from src.config import GEMORNA_3UTR_Config, three_prime_utr_vocab
+from src.data.conditional_gemorna_dataset import (
+    build_conditional_vocab,
+    ConditionalGEMORNADataset,
+    conditional_collate_fn,
+)
+from src.models.gemorna_runtime import build_gemorna_3utr_model
+from src.utils.utils_utr import UTR_
+
+
+def _ensure_legacy_module_aliases():
+    sys.modules['config'] = importlib.import_module('src.config')
+    sys.modules['tokenization'] = importlib.import_module('src.tokenization')
+    sys.modules['models.gemorna_utr'] = importlib.import_module('src.models.gemorna_utr')
+    sys.modules['utils.utils_utr'] = importlib.import_module('src.utils.utils_utr')
+
+
+def load_model_for_finetuning(checkpoint_path: str, device: str | None = None):
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    device_obj = torch.device(device)
+    _ensure_legacy_module_aliases()
+
+    model = build_gemorna_3utr_model()
+    checkpoint = torch.load(checkpoint_path, map_location=device_obj)
+    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
+    model.to(device_obj)
+    return model
+
+
+def build_conditional_finetune_model(checkpoint_path: str, device: str | None = None):
+    """Build 3'UTR model with control-tag vocab added into unused vocab slots."""
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    device_obj = torch.device(device)
+    _ensure_legacy_module_aliases()
+
+    conditional_vocab = build_conditional_vocab(three_prime_utr_vocab)
+
+    cfg = deepcopy(GEMORNA_3UTR_Config())
+    cfg.vocab_size = max(conditional_vocab.values()) + 1
+    model = UTR_(cfg)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device_obj)
+    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+    model_state = model.state_dict()
+
+    # Load all same-shaped tensors directly.
+    for key, tensor in state_dict.items():
+        if key in model_state and model_state[key].shape == tensor.shape:
+            model_state[key] = tensor
+
+    # For vocab-sized weights, copy the pretrained rows into the new bigger matrices.
+    for key in ['transformer.wte.weight', 'lm_head.weight']:
+        if key in state_dict and key in model_state:
+            rows = min(state_dict[key].shape[0], model_state[key].shape[0])
+            model_state[key][:rows] = state_dict[key][:rows]
+
+    model.load_state_dict(model_state)
+    model.to(device_obj)
+    return model, conditional_vocab
+
+
+def build_conditional_dataloader(
+    csv_path: str,
+    vocab: dict,
+    batch_size: int = 4,
+    shuffle: bool = True,
+    max_length: int = 1024,
+):
+    dataset = ConditionalGEMORNADataset(csv_path=csv_path, vocab=vocab, max_length=max_length)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=conditional_collate_fn,
+    )
+
+
+def run_conditional_finetuning(
+    train_csv: str,
+    checkpoint_path: str,
+    save_path: str,
+    val_csv: str | None = None,
+    batch_size: int = 4,
+    learning_rate: float = 1e-4,
+    num_epochs: int = 1,
+    max_length: int = 1024,
+    device: str | None = None,
+    max_steps_per_epoch: int | None = None,
+    log_every: int = 20,
+):
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    device_obj = torch.device(device)
+
+    model, conditional_vocab = build_conditional_finetune_model(checkpoint_path, device=device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    train_loader = build_conditional_dataloader(
+        csv_path=train_csv,
+        vocab=conditional_vocab,
+        batch_size=batch_size,
+        shuffle=True,
+        max_length=max_length,
+    )
+
+    history = []
+    model.train()
+    for epoch in range(1, num_epochs + 1):
+        total_loss = 0.0
+        steps = 0
+        for batch_idx, batch in enumerate(train_loader, start=1):
+            input_ids = batch['input_ids'].to(device_obj)
+            labels = batch['labels'].to(device_obj)
+            optimizer.zero_grad()
+            _, loss = model(input_ids, targets=labels)
+            loss.backward()
+            optimizer.step()
+            loss_value = float(loss.item())
+            total_loss += loss_value
+            steps += 1
+
+            if batch_idx == 1 or batch_idx % log_every == 0:
+                print(
+                    f'[Epoch {epoch} Step {batch_idx}] '
+                    f'loss={loss_value:.6f} '
+                    f'batch_shape={tuple(input_ids.shape)} '
+                    f'sample_tags={batch["pgk_tag"][0]} {batch["len_tag"][0]}'
+                )
+
+            if max_steps_per_epoch is not None and batch_idx >= max_steps_per_epoch:
+                break
+
+        avg_loss = total_loss / max(steps, 1)
+        history.append({'epoch': epoch, 'train_loss': avg_loss, 'steps': steps})
+        print(f'[Epoch {epoch}] train_loss={avg_loss:.6f} steps={steps}')
+
+    save_finetuned_checkpoint(
+        model=model,
+        save_path=save_path,
+        optimizer=optimizer,
+        epoch=num_epochs,
+        extra={
+            'control_vocab': conditional_vocab,
+            'history': history,
+            'base_vocab_size': max(three_prime_utr_vocab.values()) + 1,
+        },
+    )
+    return {'save_path': save_path, 'history': history, 'control_vocab': conditional_vocab}
+
+
+def save_finetuned_checkpoint(
+    model: torch.nn.Module,
+    save_path: str,
+    optimizer: torch.optim.Optimizer | None = None,
+    epoch: int | None = None,
+    extra: Dict[str, Any] | None = None,
+) -> None:
+    payload: Dict[str, Any] = {'model': model.state_dict()}
+    if optimizer is not None:
+        payload['optimizer'] = optimizer.state_dict()
+    if epoch is not None:
+        payload['epoch'] = epoch
+    if extra:
+        payload.update(extra)
+
+    save_file = Path(save_path)
+    save_file.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, save_file)

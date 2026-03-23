@@ -1,0 +1,36 @@
+model:
+  name: gemorna_3utr_conditional
+  pretrained_checkpoint: weights/pretrained/gemorna_3utr.pt
+  save_dir: weights/finetuned
+
+data:
+  merged_path: data/processed/embedding_with_labels_and_utr3_merged.csv
+  train_table_path: data/processed/gemorna_conditional_training_table.csv
+  sequence_column: utr3
+  id_column: ensembl_gene_id
+  expression_column: PGK
+  label_column: pgk_binary_label
+  label_tag_column: pgk_tag
+  length_column: utr3_length
+  length_bucket_column: len_bucket
+  length_tag_column: len_tag
+  control_text_column: gemorna_control_text
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  num_epochs: 3
+  max_length: 1024
+  device: cuda
+  objective: prefix_conditioned_autoregressive_next_token_prediction
+
+conditioning:
+  tag_scheme: prefix_control
+  expression_tags:
+    high: <pgk_high>
+    low: <pgk_low>
+  length_tags:
+    short: <len_short>
+    medium: <len_medium>
+    long: <len_long>
+  note: Combine expression and length tags as a textual prefix before each UTR.

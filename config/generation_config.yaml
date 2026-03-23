@@ -1,0 +1,11 @@
+model:
+  checkpoint: weights/pretrained/gemorna_3utr.pt
+  shared_library: src/models/gemorna_shared/libg2m.so
+
+sampling:
+  utr_length: medium
+  num_samples: 10
+  device: cuda
+
+output:
+  path: results/generated_sequences/gemorna_3utr_generations.txt
