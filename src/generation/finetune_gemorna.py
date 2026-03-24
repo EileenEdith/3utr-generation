@@ -8,6 +8,7 @@ import sys
 
 import torch
 from torch.utils.data import DataLoader
+import pandas as pd
 
 from src.config import GEMORNA_3UTR_Config, three_prime_utr_vocab
 from src.data.conditional_gemorna_dataset import (
@@ -15,6 +16,7 @@ from src.data.conditional_gemorna_dataset import (
     ConditionalGEMORNADataset,
     conditional_collate_fn,
 )
+from src.data.prepare_conditional_splits import prepare_conditional_splits
 from src.models.gemorna_runtime import build_gemorna_3utr_model
 from src.utils.utils_utr import UTR_
 
@@ -99,9 +101,18 @@ def run_conditional_finetuning(
     device: str | None = None,
     max_steps_per_epoch: int | None = None,
     log_every: int = 20,
+    make_split_if_missing: bool = True,
 ):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     device_obj = torch.device(device)
+
+    if val_csv is None:
+        val_csv = str(Path(train_csv).with_name(Path(train_csv).stem + '_val.csv'))
+
+    if make_split_if_missing and not Path(val_csv).exists():
+        split_train = str(Path(train_csv).with_name(Path(train_csv).stem + '_train.csv'))
+        prepare_conditional_splits(train_csv, split_train, val_csv)
+        train_csv = split_train
 
     model, conditional_vocab = build_conditional_finetune_model(checkpoint_path, device=device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -113,8 +124,18 @@ def run_conditional_finetuning(
         shuffle=True,
         max_length=max_length,
     )
+    val_loader = None
+    if val_csv and Path(val_csv).exists():
+        val_loader = build_conditional_dataloader(
+            csv_path=val_csv,
+            vocab=conditional_vocab,
+            batch_size=batch_size,
+            shuffle=False,
+            max_length=max_length,
+        )
 
     history = []
+    best_val_loss = None
     model.train()
     for epoch in range(1, num_epochs + 1):
         total_loss = 0.0
@@ -142,8 +163,39 @@ def run_conditional_finetuning(
                 break
 
         avg_loss = total_loss / max(steps, 1)
-        history.append({'epoch': epoch, 'train_loss': avg_loss, 'steps': steps})
-        print(f'[Epoch {epoch}] train_loss={avg_loss:.6f} steps={steps}')
+        val_loss = None
+        if val_loader is not None:
+            model.eval()
+            val_total = 0.0
+            val_steps = 0
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_input_ids = val_batch['input_ids'].to(device_obj)
+                    val_labels = val_batch['labels'].to(device_obj)
+                    _, vloss = model(val_input_ids, targets=val_labels)
+                    val_total += float(vloss.item())
+                    val_steps += 1
+            val_loss = val_total / max(val_steps, 1)
+            model.train()
+
+        history.append({'epoch': epoch, 'train_loss': avg_loss, 'val_loss': val_loss, 'steps': steps})
+        print(f'[Epoch {epoch}] train_loss={avg_loss:.6f} val_loss={val_loss if val_loss is not None else "NA"} steps={steps}')
+
+        if val_loss is not None and (best_val_loss is None or val_loss < best_val_loss):
+            best_val_loss = val_loss
+            best_path = str(Path(save_path).with_name(Path(save_path).stem + '_best.pt'))
+            save_finetuned_checkpoint(
+                model=model,
+                save_path=best_path,
+                optimizer=optimizer,
+                epoch=epoch,
+                extra={
+                    'control_vocab': conditional_vocab,
+                    'history': history,
+                    'base_vocab_size': max(three_prime_utr_vocab.values()) + 1,
+                    'best_val_loss': best_val_loss,
+                },
+            )
 
     save_finetuned_checkpoint(
         model=model,
@@ -154,9 +206,12 @@ def run_conditional_finetuning(
             'control_vocab': conditional_vocab,
             'history': history,
             'base_vocab_size': max(three_prime_utr_vocab.values()) + 1,
+            'best_val_loss': best_val_loss,
+            'train_csv': train_csv,
+            'val_csv': val_csv,
         },
     )
-    return {'save_path': save_path, 'history': history, 'control_vocab': conditional_vocab}
+    return {'save_path': save_path, 'history': history, 'control_vocab': conditional_vocab, 'best_val_loss': best_val_loss, 'train_csv': train_csv, 'val_csv': val_csv}
 
 
 def save_finetuned_checkpoint(

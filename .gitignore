@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+data/raw/
+data/processed/
+
+weights/
+
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+.ipynb_checkpoints/
+.DS_Store
