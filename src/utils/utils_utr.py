@@ -30,7 +30,7 @@ class UTR_(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=MEAN, std=STD)
 
-    def forward(self, input_ids, targets=None):
+    def forward(self, input_ids, targets=None, return_hidden_states=False):
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
         pos_indices = torch.arange(seq_len, dtype=torch.long, device=device)
@@ -45,6 +45,8 @@ class UTR_(nn.Module):
 
         if targets is None:
             logits = self.lm_head(hidden_states[:, [-1], :])
+            if return_hidden_states:
+                return logits, None, hidden_states
             return logits, None
 
         logits = self.lm_head(hidden_states)
@@ -53,4 +55,6 @@ class UTR_(nn.Module):
             targets.reshape(-1),
             ignore_index=-100,
         )
+        if return_hidden_states:
+            return logits, loss, hidden_states
         return logits, loss

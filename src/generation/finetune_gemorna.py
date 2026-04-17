@@ -19,6 +19,7 @@ from src.data.conditional_gemorna_dataset import (
 from src.data.prepare_conditional_splits import prepare_conditional_splits
 from src.models.gemorna_runtime import build_gemorna_3utr_model
 from src.utils.utils_utr import UTR_
+import torch.nn as nn
 
 
 def _ensure_legacy_module_aliases():
@@ -73,6 +74,16 @@ def build_conditional_finetune_model(checkpoint_path: str, device: str | None = 
     return model, conditional_vocab
 
 
+def freeze_lower_transformer_blocks(model: torch.nn.Module, freeze_ratio: float = 0.5):
+    n_blocks = len(model.transformer['h'])
+    freeze_n = int(n_blocks * freeze_ratio)
+    for i, block in enumerate(model.transformer['h']):
+        if i < freeze_n:
+            for p in block.parameters():
+                p.requires_grad = False
+    return freeze_n
+
+
 def build_conditional_dataloader(
     csv_path: str,
     vocab: dict,
@@ -102,6 +113,9 @@ def run_conditional_finetuning(
     max_steps_per_epoch: int | None = None,
     log_every: int = 20,
     make_split_if_missing: bool = True,
+    freeze_lower_ratio: float = 0.0,
+    use_length_aux_loss: bool = False,
+    length_aux_weight: float = 0.2,
 ):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     device_obj = torch.device(device)
@@ -115,7 +129,16 @@ def run_conditional_finetuning(
         train_csv = split_train
 
     model, conditional_vocab = build_conditional_finetune_model(checkpoint_path, device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    frozen_blocks = 0
+    if freeze_lower_ratio > 0:
+        frozen_blocks = freeze_lower_transformer_blocks(model, freeze_ratio=freeze_lower_ratio)
+    length_head = None
+    if use_length_aux_loss:
+        length_head = nn.Linear(model.config.n_embd, 1).to(device_obj)
+    params = [p for p in model.parameters() if p.requires_grad]
+    if length_head is not None:
+        params += list(length_head.parameters())
+    optimizer = torch.optim.AdamW(params, lr=learning_rate)
 
     train_loader = build_conditional_dataloader(
         csv_path=train_csv,
@@ -144,7 +167,22 @@ def run_conditional_finetuning(
             input_ids = batch['input_ids'].to(device_obj)
             labels = batch['labels'].to(device_obj)
             optimizer.zero_grad()
-            _, loss = model(input_ids, targets=labels)
+            if use_length_aux_loss:
+                _, lm_loss, hidden_states = model(input_ids, targets=labels, return_hidden_states=True)
+                prompt_token_count = torch.tensor(batch['prompt_token_count'], dtype=torch.long, device=device_obj)
+                target_token_length = torch.tensor(batch['utr3_token_length'], dtype=torch.float32, device=device_obj)
+                pooled = []
+                for bi in range(hidden_states.shape[0]):
+                    idx = max(0, min(int(prompt_token_count[bi].item()) - 1, hidden_states.shape[1] - 1))
+                    pooled.append(hidden_states[bi, idx, :])
+                pooled = torch.stack(pooled, dim=0)
+                pred_len = length_head(pooled).squeeze(-1)
+                length_loss = torch.nn.functional.mse_loss(pred_len, target_token_length)
+                loss = lm_loss + length_aux_weight * length_loss
+            else:
+                _, loss = model(input_ids, targets=labels)
+                lm_loss = loss
+                length_loss = None
             loss.backward()
             optimizer.step()
             loss_value = float(loss.item())
@@ -152,9 +190,12 @@ def run_conditional_finetuning(
             steps += 1
 
             if batch_idx == 1 or batch_idx % log_every == 0:
+                extra = ''
+                if use_length_aux_loss and length_loss is not None:
+                    extra = f' lm_loss={float(lm_loss.item()):.6f} len_loss={float(length_loss.item()):.6f}'
                 print(
                     f'[Epoch {epoch} Step {batch_idx}] '
-                    f'loss={loss_value:.6f} '
+                    f'loss={loss_value:.6f}{extra} '
                     f'batch_shape={tuple(input_ids.shape)} '
                     f'sample_tags={batch["pgk_tag"][0]} {batch["len_tag"][0]}'
                 )
@@ -172,7 +213,20 @@ def run_conditional_finetuning(
                 for val_batch in val_loader:
                     val_input_ids = val_batch['input_ids'].to(device_obj)
                     val_labels = val_batch['labels'].to(device_obj)
-                    _, vloss = model(val_input_ids, targets=val_labels)
+                    if use_length_aux_loss:
+                        _, vlm_loss, vhidden = model(val_input_ids, targets=val_labels, return_hidden_states=True)
+                        vprompt_token_count = torch.tensor(val_batch['prompt_token_count'], dtype=torch.long, device=device_obj)
+                        vtarget_token_length = torch.tensor(val_batch['utr3_token_length'], dtype=torch.float32, device=device_obj)
+                        vpooled = []
+                        for bi in range(vhidden.shape[0]):
+                            idx = max(0, min(int(vprompt_token_count[bi].item()) - 1, vhidden.shape[1] - 1))
+                            vpooled.append(vhidden[bi, idx, :])
+                        vpooled = torch.stack(vpooled, dim=0)
+                        vpred_len = length_head(vpooled).squeeze(-1)
+                        vlen_loss = torch.nn.functional.mse_loss(vpred_len, vtarget_token_length)
+                        vloss = vlm_loss + length_aux_weight * vlen_loss
+                    else:
+                        _, vloss = model(val_input_ids, targets=val_labels)
                     val_total += float(vloss.item())
                     val_steps += 1
             val_loss = val_total / max(val_steps, 1)
@@ -209,9 +263,13 @@ def run_conditional_finetuning(
             'best_val_loss': best_val_loss,
             'train_csv': train_csv,
             'val_csv': val_csv,
+            'freeze_lower_ratio': freeze_lower_ratio,
+            'frozen_blocks': frozen_blocks,
+            'use_length_aux_loss': use_length_aux_loss,
+            'length_aux_weight': length_aux_weight,
         },
     )
-    return {'save_path': save_path, 'history': history, 'control_vocab': conditional_vocab, 'best_val_loss': best_val_loss, 'train_csv': train_csv, 'val_csv': val_csv}
+    return {'save_path': save_path, 'history': history, 'control_vocab': conditional_vocab, 'best_val_loss': best_val_loss, 'train_csv': train_csv, 'val_csv': val_csv, 'freeze_lower_ratio': freeze_lower_ratio, 'frozen_blocks': frozen_blocks, 'use_length_aux_loss': use_length_aux_loss}
 
 
 def save_finetuned_checkpoint(

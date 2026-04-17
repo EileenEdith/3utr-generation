@@ -14,3 +14,9 @@ weights/
 
 .ipynb_checkpoints/
 .DS_Store
+
+# Large data files
+notebooks/3UTRDB/
+notebooks/df_final.tsv
+src/classification/merged.json
+src/classification/external_predictions.json

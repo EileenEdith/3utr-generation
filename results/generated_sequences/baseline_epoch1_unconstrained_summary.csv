@@ -1,0 +1,4 @@
+prompt,n,unique_outputs,mean_token_length,std_token_length,mean_seq_length,std_seq_length,mean_gc,mean_repetition,shannon_diversity
+<pgk_high> <len_long>,6,6,63.0,0.0,180.0,0.0,0.5750000000000001,0.33891992551210426,1.9289210097595364
+<pgk_high> <len_short>,6,6,63.0,0.0,180.0,0.0,0.6361111111111112,0.33054003724394787,1.9073028894638648
+<pgk_low> <len_short>,6,6,63.0,0.0,180.0,0.0,0.524074074074074,0.4432029795158287,1.9771406951298978

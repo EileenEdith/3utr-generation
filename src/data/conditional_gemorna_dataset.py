@@ -12,6 +12,7 @@ from src.tokenization import numericalize
 
 CONTROL_TAGS = [
     '<pgk_high>',
+    '<pgk_mid>',
     '<pgk_low>',
     '<len_short>',
     '<len_medium>',
@@ -19,7 +20,7 @@ CONTROL_TAGS = [
 ]
 
 
-def build_conditional_vocab(base_vocab: Dict[str, int]) -> Dict[str, int]:
+def build_conditional_vocab(base_vocab: Dict[str, int]) -> Dict[str, int]: #컨트롤 택을 추가한 vocab을 만들어주는 함수
     vocab = dict(base_vocab)
     next_id = max(vocab.values()) + 1
     for tag in CONTROL_TAGS:
@@ -62,6 +63,9 @@ class ConditionalGEMORNADataset(Dataset):
             ids = ids[: self.max_length]
         input_ids = torch.tensor(ids[:-1], dtype=torch.long)
         labels = torch.tensor(ids[1:], dtype=torch.long)
+        prompt_text = f"{row['pgk_tag']} {row['len_tag']}"
+        prompt_ids = numericalize(prompt_text, self.vocab)
+        prompt_token_count = max(1, len(prompt_ids) - 1)  # exclude trailing eos from prompt-only numericalize
         return {
             'input_ids': input_ids,
             'labels': labels,
@@ -69,6 +73,8 @@ class ConditionalGEMORNADataset(Dataset):
             'pgk_tag': row['pgk_tag'],
             'len_tag': row['len_tag'],
             'utr3_length': int(row.get('utr3_length', len(row['utr3']))),
+            'utr3_token_length': int((len(str(row['utr3'])) + 2) // 3),
+            'prompt_token_count': int(prompt_token_count),
         }
 
 
@@ -82,6 +88,8 @@ def conditional_collate_fn(batch: List[dict], pad_token_id: int = 0):
         'pgk_tag': [],
         'len_tag': [],
         'utr3_length': [],
+        'utr3_token_length': [],
+        'prompt_token_count': [],
     }
 
     for i, item in enumerate(batch):
@@ -92,6 +100,8 @@ def conditional_collate_fn(batch: List[dict], pad_token_id: int = 0):
         meta['pgk_tag'].append(item['pgk_tag'])
         meta['len_tag'].append(item['len_tag'])
         meta['utr3_length'].append(item['utr3_length'])
+        meta['utr3_token_length'].append(item['utr3_token_length'])
+        meta['prompt_token_count'].append(item['prompt_token_count'])
 
     return {
         'input_ids': input_ids,
